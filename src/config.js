@@ -1,4 +1,6 @@
-// src/config.js — Central configuration for DeepSeek Agent
+// src/config.js — Central configuration for DeepSeek Browser Agent
+'use strict';
+
 const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
@@ -16,10 +18,22 @@ const defaults = {
   RESPONSE_TIMEOUT : 180_000,
   STABLE_DELAY     : 2_500,
   SEND_DELAY       : 400,
+  BUSY_MAX_RETRIES : 20,
+  BUSY_RETRY_DELAY : 3_000,
 
   // Agent
-  MAX_ITERATIONS   : 40,
+  MAX_ITERATIONS   : 300,
+  CONTEXT_LIMIT    : 128_000, // tokens (estimate)
+  CONTEXT_ROLLOVER : 0.9,     // summarize + move to a new chat at this fraction
   WORKING_DIR      : process.cwd(),
+
+  // Agent browser tab (browser_* tools)
+  WEB_TIMEOUT      : 30_000,
+
+  // MCP servers — same format as Claude Desktop / Cursor: { "name": { command, args, env, cwd } }
+  mcpServers        : {},
+  MCP_START_TIMEOUT : 60_000,  // first `npx -y …` run downloads the package
+  MCP_CALL_TIMEOUT  : 120_000,
 
   // Output
   MAX_OUTPUT_LENGTH : 8_000,
@@ -29,8 +43,9 @@ const defaults = {
 // ─────────────────────────────────────────────
 //  Config loading priority (highest wins):
 //
-//  1. ~/.deepseek-agent/config.json  — global user config
-//  2. ./deepseek-agent.config.json   — per-project config
+//  1. ./deepseek-agent.config.json   — per-project config
+//  2. ~/.deepseek-agent/config.json  — global user config
+//  3. built-in defaults
 // ─────────────────────────────────────────────
 
 function loadJson(filePath) {
@@ -47,10 +62,15 @@ function loadJson(filePath) {
 const globalConfigPath  = path.join(os.homedir(), '.deepseek-agent', 'config.json');
 const projectConfigPath = path.join(process.cwd(), 'deepseek-agent.config.json');
 
+const globalConfig  = loadJson(globalConfigPath);
+const projectConfig = loadJson(projectConfigPath);
+
 const config = {
   ...defaults,
-  ...loadJson(globalConfigPath),   // global overrides defaults
-  ...loadJson(projectConfigPath),  // project overrides global
+  ...globalConfig,   // global overrides defaults
+  ...projectConfig,  // project overrides global
+  // MCP servers merge per server name instead of the project list replacing the global one
+  mcpServers: { ...globalConfig.mcpServers, ...projectConfig.mcpServers },
 };
 
 // Remove comment keys from JSON files

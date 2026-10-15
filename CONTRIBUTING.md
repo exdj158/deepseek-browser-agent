@@ -1,12 +1,12 @@
 # Contributing to DeepSeek Browser Agent
 
-Thank you for your interest in contributing! This project is in active development and all contributions are welcome.
+Thank you for your interest in contributing! All contributions are welcome.
 
 ## Getting Started
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/deepseek-browser-agent
-cd deepseek-browser-agent
+git clone https://github.com/JustGimli/deepseek-browser-agent-pro
+cd deepseek-browser-agent-pro
 npm install
 npx playwright install chromium
 node src/index.js --interactive
@@ -17,16 +17,17 @@ node src/index.js --interactive
 | File | Role |
 |---|---|
 | `src/agent.js` | Core agent loop — edit this to change how tasks run |
-| `src/browser.js` | All Playwright / DOM interaction |
+| `src/browser.js` | Playwright / DOM interaction with chat.deepseek.com |
 | `src/parser.js` | Parses AI text responses into tool calls |
-| `src/tools.js` | Add new tools here |
+| `src/tools/` | Tools by area (`fs`, `shell`, `net`, `browser`); `index.js` is the registry |
+| `src/mcp.js` | MCP client — registers tools of configured MCP servers |
 | `src/prompt.js` | System prompt sent to DeepSeek |
 | `src/config.js` | Configuration loading |
 
 ## Adding a New Tool
 
-1. Open `src/tools.js`
-2. Add an entry to the `TOOLS` object following the existing pattern:
+1. Open the matching module in `src/tools/` (or create one exporting `{ tools }` and spread it into `TOOLS` in `src/tools/index.js`)
+2. Add an entry to its `tools` object following the existing pattern:
 
 ```js
 my_new_tool: {
@@ -35,8 +36,8 @@ my_new_tool: {
     param1: { type: 'string', required: true,  description: 'What param1 is' },
     param2: { type: 'number', required: false, description: 'What param2 is' },
   },
-  async execute({ param1, param2 }) {
-    // your implementation
+  async execute({ param1, param2 }, { signal }) {
+    // your implementation; signal aborts when the user stops the task
     return 'result string';
   },
 },
@@ -49,7 +50,7 @@ The tool is automatically included in the AI's system prompt — no other files 
 - One feature or bug fix per PR
 - Keep the existing code style (single quotes, 2-space indent)
 - Update `README.md` if you add a new tool or config option
-- Test your change manually before submitting
+- Run `npm test` and try your change manually before submitting
 
 ## Reporting Bugs
 

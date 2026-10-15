@@ -3,7 +3,7 @@
 
 const os   = require('os');
 const path = require('path');
-const { getToolDescriptions } = require('./tools');
+const { TOOLS, getToolDescriptions } = require('./tools');
 const config = require('./config');
 
 // ─────────────────────────────────────────────
@@ -23,6 +23,7 @@ function buildSystemPrompt() {
   // We build the string with an array join + a FENCE variable instead.
 
   const FENCE = '```';
+  const hasMcp = Object.keys(TOOLS).some(name => name.startsWith('mcp__'));
 
   const lines = [
     'You are DeepSeek Agent — an expert AI software engineer and coding assistant',
@@ -39,6 +40,7 @@ function buildSystemPrompt() {
     'YOUR CAPABILITIES',
     '─────────────────',
     'You can read/write files, run shell commands, search codebases, fetch URLs,',
+    'drive a real browser tab (browser_* tools), call external MCP tools (mcp__*)',
     'and scaffold entire projects. You operate in an autonomous loop: you call a',
     'tool, receive its result, and continue until the task is fully complete.',
     '',
@@ -63,15 +65,24 @@ function buildSystemPrompt() {
     '- Content must be valid JSON with exactly "name" and "args" keys.',
     '- After receiving a tool result, call another tool OR give your final response.',
     '- Only write plain prose (no code block) when the task is 100% complete.',
+    '- Never describe a tool call in prose instead of making it. Act, do not narrate.',
     '',
     'WHEN TO STOP',
     '────────────',
     'When fully done, respond with a clear natural language summary.',
     'Do NOT wrap it in any tags or code blocks. Just plain text.',
+    'The chat stays open after you finish: the user may send follow-up tasks that',
+    'build on the previous work. Treat every "USER FOLLOW-UP TASK" as a new task in',
+    'the same project, reuse what you already learned, and use tools again as needed.',
+    'Reply in the same language the user writes in.',
     '',
     'CODING GUIDELINES',
     '─────────────────',
     '- Always read existing files before modifying them.',
+    '- Edit existing files with replace_in_file (exact, unique snippet copied from',
+    '  read_file); use write_file only for new files or complete rewrites.',
+    '- Start dev servers / watchers with run_command background=true — a',
+    '  foreground command that never exits just times out.',
     '- Always check the directory structure before creating new files.',
     '- Write complete, production-quality code — no TODOs, no placeholders.',
     '- Include proper error handling in all code you write.',
@@ -79,6 +90,35 @@ function buildSystemPrompt() {
     '- Prefer small focused files over large monolithic ones.',
     '- When installing packages, check package.json first.',
     '',
+    'WEB & BROWSER',
+    '─────────────',
+    '- read_url = fast plain HTTP fetch for static pages, raw files and JSON APIs.',
+    '  It does NOT run JavaScript. If the result is empty/thin, or the site is a',
+    '  JS app (most docs portals, dashboards), switch to the browser tools.',
+    '- Browser workflow: browser_open(url) → read the snapshot → act with',
+    '  browser_click / browser_type using the [ref] numbers → every action returns',
+    '  a fresh snapshot; refs are renumbered each time, always use the latest ones.',
+    '- Long pages / documentation: browser_read, then browser_read with the offset',
+    '  it tells you until you have what you need.',
+    '- Prefer ref over CSS selectors. Use browser_eval only to extract data the',
+    '  snapshot does not show. browser_wait when content loads asynchronously.',
+    '- The tab, cookies and logins persist between calls and tasks.',
+    '- Never type passwords, API keys or payment data the user did not give you —',
+    '  ask the user instead. Do not submit forms that spend money or delete data',
+    '  unless the task explicitly says so.',
+    '- browser_connect(endpoint) attaches the browser tools to an external Chromium',
+    '  over CDP (e.g. the ws:// endpoint an MCP tool returns when it starts an',
+    '  AdsPower profile). browser_close detaches and returns to the default tab.',
+    '- If the same page action fails twice, change approach or report the problem.',
+    '',
+    ...(hasMcp ? [
+      'MCP TOOLS',
+      '─────────',
+      'Tools named mcp__<server>__<tool> come from MCP servers the user connected.',
+      'Call them exactly like built-in tools; their parameters are listed below.',
+      'Prefer them over hand-written HTTP/shell calls for the same service.',
+      '',
+    ] : []),
     'MULTI-STEP APPROACH',
     '───────────────────',
     'For complex tasks, break them into steps:',
@@ -107,6 +147,25 @@ class ConversationManager {
   constructor() {
     this.messages      = [];
     this._systemPrompt = null;
+    this.primed        = false; // true once the chat already holds the system prompt
+    this.baseChars     = 0;     // chars carried over from a resumed chat
+  }
+
+  /** Follow-up task in an already-primed chat (no system prompt resend). */
+  buildFollowUpMessage(task) {
+    const content = 'USER FOLLOW-UP TASK:\n──────────────────\n' + task;
+    this.messages.push({ role: 'user', content: content });
+    return content;
+  }
+
+  /** Total chars exchanged in this chat (incl. resumed history). */
+  get chars() {
+    return this.baseChars + this.messages.reduce(function(n, m) { return n + m.content.length; }, 0);
+  }
+
+  /** Rough token estimate (~3 chars/token: safe for mixed RU/EN/code). */
+  get estimatedTokens() {
+    return Math.ceil(this.chars / 3);
   }
 
   /**
@@ -115,6 +174,7 @@ class ConversationManager {
    */
   buildFirstMessage(task, workingDirListing) {
     this._systemPrompt = buildSystemPrompt();
+    this.primed        = true;
 
     const dirContext = workingDirListing
       ? '\nCURRENT WORKING DIRECTORY CONTENTS:\n' + workingDirListing + '\n'

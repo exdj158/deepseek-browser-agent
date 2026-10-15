@@ -2,9 +2,11 @@
 'use strict';
 
 const { chromium } = require('playwright');
+const os           = require('os');
 const path         = require('path');
 const config       = require('./config');
 const logger       = require('./logger');
+const { stripThinkingBlocks } = require('./parser');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Selector banks — ordered by likelihood, with fallbacks
@@ -51,14 +53,45 @@ const SEL = {
     '[class*="newChat"]',
   ],
 
-  // The main chat messages container
-  messageContainer: [
-    '[class*="chat-content"]',
-    '[class*="message-list"]',
-    '[class*="conversation"]',
-    'main',
+  // One block per assistant reply — counted to notice that a new reply started
+  assistantMessage: [
+    '[class*="assistant"][class*="message"]',
+    '[data-role="assistant"]',
+    '[class*="markdown-content"]',
+    '.ds-markdown',
+    '[class*="chat-message"]',
+    '[class*="message-bubble"]',
+  ],
+
+  // Content element of an assistant reply — the last match is the reply being read
+  assistantContent: [
+    '.ds-markdown',
+    '[class*="assistant"] [class*="markdown"]',
+    '[class*="assistant"] [class*="content"]',
+    '[data-role="assistant"] [class*="content"]',
+    '[class*="ai-message"] [class*="content"]',
+    '[class*="bot-message"] [class*="content"]',
+    '[class*="response-content"]',
+    '[class*="message-content"]:last-child',
+  ],
+
+  // Anything visible from this list means DeepSeek is still generating
+  generating: [
+    'button[aria-label*="Stop" i]',
+    '[class*="stop-gen"]',
+    '[class*="stopGen"]',
+    '[class*="generating"]',
+    '[class*="typing"]',
+    '[class*="loading"]',
+    '[class*="spinner"]',
+    '[class*="blink"]',
+    '[class*="cursor"]',
+    '[class*="pulsing"]',
   ],
 };
+
+// Banner DeepSeek shows when its backend is overloaded
+const BUSY_RE = /server is (temporarily )?(busy|unavailable)|temporarily unavailable/i;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DeepSeekBrowser class
@@ -69,6 +102,7 @@ class DeepSeekBrowser {
     this.context  = null;
     this.page     = null;
     this._closed  = false;
+    this.abort    = false; // set by the agent to cut waitForResponse short
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -90,8 +124,6 @@ class DeepSeekBrowser {
         '--disable-blink-features=AutomationControlled',
         '--no-first-run',
         '--disable-default-apps',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
       ],
       ignoreDefaultArgs: ['--enable-automation'],
     });
@@ -115,6 +147,14 @@ class DeepSeekBrowser {
     if (this._closed) return;
     this._closed = true;
     try { await this.context?.close(); } catch {}
+  }
+
+  /** Restart the browser in headless / headed mode (session dir is kept) */
+  async relaunch(headless) {
+    config.HEADLESS = headless;
+    await this.close();
+    this._closed = false;
+    await this.launch();
   }
 
   // ── Navigation ─────────────────────────────────────────────────────────────
@@ -168,6 +208,9 @@ class DeepSeekBrowser {
     });
 
     if (needsLogin) {
+      if (config.HEADLESS) {
+        throw new Error('Login required — run without --headless once to log in (session is saved).');
+      }
       this._printLoginBanner();
       await this._waitForEnter();
       await this.page.waitForTimeout(2_000);
@@ -265,7 +308,7 @@ class DeepSeekBrowser {
       'Cannot find the DeepSeek chat input box.\n' +
       '  → Make sure the page is fully loaded and you are logged in.\n' +
       '  → Run with --debug to inspect DOM selectors.\n' +
-      '  → Run: node src/calibrate.js to auto-detect selectors.'
+      '  → Run: deepseek-agent --calibrate to inspect the page.'
     );
   }
 
@@ -303,7 +346,7 @@ class DeepSeekBrowser {
     const initialCount = await this._getMessageCount();
     let   appeared     = false;
 
-    while (Date.now() - start < 12_000) {
+    while (Date.now() - start < 12_000 && !this.abort) {
       const count = await this._getMessageCount();
       if (count > initialCount) { appeared = true; break; }
       await this.page.waitForTimeout(400);
@@ -315,8 +358,23 @@ class DeepSeekBrowser {
     let lastText    = '';
     let stableStart = null;
     let dotCount    = 0;
+    let busyRetries = 0;
+    let deadline    = start + timeout;
 
-    while (Date.now() - start < timeout) {
+    while (Date.now() < deadline) {
+      if (this.abort) { await this._clickStop(); break; }
+      // Server busy banner → click Continue and keep waiting (never "done")
+      if (await this._handleServerBusy()) {
+        if (++busyRetries > config.BUSY_MAX_RETRIES) {
+          throw new Error(`DeepSeek server still unavailable after ${config.BUSY_MAX_RETRIES} retries.`);
+        }
+        lastText    = '';
+        stableStart = null;
+        deadline    = Math.max(deadline, Date.now() + timeout / 2);
+        await this.page.waitForTimeout(config.BUSY_RETRY_DELAY);
+        continue;
+      }
+
       const text = await this._extractLastMessage();
 
       if (text !== lastText) {
@@ -347,27 +405,19 @@ class DeepSeekBrowser {
 
   /** Count how many "response" blocks are visible */
   async _getMessageCount() {
-    return await this.page.evaluate(() => {
-      const candidates = [
-        '[class*="assistant"][class*="message"]',
-        '[data-role="assistant"]',
-        '[class*="markdown-content"]',
-        '.ds-markdown',
-        '[class*="chat-message"]',
-        '[class*="message-bubble"]',
-      ];
+    return await this.page.evaluate(candidates => {
       for (const sel of candidates) {
         const els = document.querySelectorAll(sel);
         if (els.length > 0) return els.length;
       }
       // Broad fallback
       return document.querySelectorAll('[class*="message"]').length;
-    });
+    }, SEL.assistantMessage);
   }
 
   /** Extract the text of the last assistant message — including code blocks */
   async _extractLastMessage() {
-    return await this.page.evaluate(() => {
+    return await this.page.evaluate(directSelectors => {
 
       // ── Helper: get all text including code blocks ────────────────────────
       // Walks the DOM and reconstructs text, re-adding fence markers for code
@@ -384,6 +434,31 @@ class DeepSeekBrowser {
           }
           if (node.nodeType !== Node.ELEMENT_NODE) return;
           const tag = node.tagName.toLowerCase();
+
+          // Buttons (Copy / Download / Run…) are UI chrome, not content
+          if (tag === 'button') return;
+
+          // Tables → markdown pipe rows so the terminal can render them
+          if (tag === 'table') {
+            const cell = c => (c.innerText || '').replace(/\s*\n\s*/g, ' ').replace(/\|/g, '\\|').trim();
+            const rows = Array.from(node.querySelectorAll('tr')).map(tr =>
+              '| ' + Array.from(tr.children).map(cell).join(' | ') + ' |');
+            if (rows.length) {
+              const cols = (rows[0].match(/ \| /g) || []).length + 1;
+              rows.splice(1, 0, '|' + ' --- |'.repeat(cols));
+              result += '\n' + rows.join('\n') + '\n';
+            }
+            return;
+          }
+
+          // Headings / bold / list items keep their markdown markers
+          if (/^h[1-6]$/.test(tag)) result += '\n' + '#'.repeat(Number(tag[1])) + ' ';
+          if (tag === 'strong' || tag === 'b') result += '**';
+          if (tag === 'li') {
+            const p = node.parentElement;
+            result += p && p.tagName.toLowerCase() === 'ol'
+              ? (Array.prototype.indexOf.call(p.children, node) + 1) + '. ' : '- ';
+          }
 
           // <pre> wraps a fenced code block — reconstruct the backtick fence
           // so the parser can match the ```tool_call regex.
@@ -412,6 +487,8 @@ class DeepSeekBrowser {
 
           for (const child of node.childNodes) walk(child);
 
+          if (tag === 'strong' || tag === 'b') result += '**';
+
           if (['p','div','li','br','h1','h2','h3','h4','h5','h6'].includes(tag)) {
             result += '\n';
           }
@@ -422,17 +499,6 @@ class DeepSeekBrowser {
       }
 
       // ── Attempt 1: Specific assistant-message selectors ──────────────────
-      const directSelectors = [
-        '.ds-markdown',
-        '[class*="assistant"] [class*="markdown"]',
-        '[class*="assistant"] [class*="content"]',
-        '[data-role="assistant"] [class*="content"]',
-        '[class*="ai-message"] [class*="content"]',
-        '[class*="bot-message"] [class*="content"]',
-        '[class*="response-content"]',
-        '[class*="message-content"]:last-child',
-      ];
-
       for (const sel of directSelectors) {
         const els = document.querySelectorAll(sel);
         if (els.length > 0) {
@@ -469,48 +535,52 @@ class DeepSeekBrowser {
       }
 
       return '';
-    });
+    }, SEL.assistantContent);
+  }
+
+  /** Click DeepSeek's "stop generating" button if it is showing */
+  async _clickStop() {
+    for (const sel of SEL.stopButton) {
+      try {
+        const el = await this.page.$(sel);
+        if (el && await el.isVisible()) { await el.click(); return; }
+      } catch {}
+    }
+  }
+
+  /** If the "server unavailable" banner is up, click Continue/Retry. Returns true if banner seen. */
+  async _handleServerBusy() {
+    // Only short, visible elements outside chat markdown/code count — the model's own
+    // reply (or files it read) can contain the phrase and must not trigger this.
+    const busy = await this.page.evaluate(re => {
+      const rx = new RegExp(re, 'i');
+      return Array.from(document.querySelectorAll('div, span, p')).some(el => {
+        if (el.children.length > 3 || el.offsetParent === null) return false;
+        if (el.closest('[class*="markdown"], pre, code, textarea, nav, [class*="sidebar"]')) return false;
+        const t = (el.innerText || '').trim();
+        return t.length > 0 && t.length < 150 && rx.test(t);
+      });
+    }, BUSY_RE.source);
+    if (!busy) return false;
+
+    // The banner stays in the chat after Continue is clicked, so the real signal is the
+    // "Continue" button itself: it exists only while the stream is actually stopped.
+    const btn = this.page.getByRole('button', { name: /^continue$/i }).last();
+    if (!await btn.isVisible().catch(() => false)) return false;
+
+    logger.warn('DeepSeek: server unavailable — clicking Continue...');
+    try { await btn.click({ timeout: 3_000 }); } catch {}
+    return true;
   }
 
   /** True if DeepSeek is still streaming / generating */
   async _isGenerating() {
-    return await this.page.evaluate(() => {
-      // Check for stop button
-      const stopSelectors = [
-        'button[aria-label*="Stop" i]',
-        '[class*="stop-gen"]',
-        '[class*="stopGen"]',
-        '[class*="generating"]',
-      ];
-      for (const sel of stopSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const s = window.getComputedStyle(el);
-          if (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0') return true;
-        }
-      }
-
-      // Check for animated loading/typing indicators
-      const loaderSelectors = [
-        '[class*="typing"]',
-        '[class*="loading"]',
-        '[class*="spinner"]',
-        '[class*="blink"]',
-        '[class*="cursor"]',
-        '[class*="pulsing"]',
-        'svg[class*="loading"]',
-        'svg[class*="spinner"]',
-      ];
-      for (const sel of loaderSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const s = window.getComputedStyle(el);
-          if (s.display !== 'none' && s.visibility !== 'hidden') return true;
-        }
-      }
-
-      return false;
-    });
+    return await this.page.evaluate(selectors => selectors.some(sel => {
+      const el = document.querySelector(sel);
+      if (!el) return false;
+      const s = window.getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+    }), SEL.generating);
   }
 
   // ── Text Cleanup ───────────────────────────────────────────────────────────
@@ -518,11 +588,11 @@ class DeepSeekBrowser {
   _cleanText(text) {
     if (!text) return '';
 
-    return text
-      // Strip DeepSeek R1 chain-of-thought blocks
-      .replace(/<think>[\s\S]*?<\/think>\n?/gi, '')
-      // Strip "Thinking..." headers that sometimes prefix responses
-      .replace(/^Thinking\.{0,3}\n[\s\S]*?\n\n/m, '')
+    // Chain-of-thought blocks / "Thinking..." headers first (same rules as the parser)
+    return stripThinkingBlocks(text)
+      // Strip "label / Copy / Download" code-block chrome, keep the label as the fence language
+      .replace(/(?:^|\n)(?:([\w+#.-]{1,20})\s*\n+)?(?:(?:Copy|Download)\s*\n+)+```(\w*)\n/g,
+        (_, label, lang) => '\n```' + (lang || label || '') + '\n')
       // Strip copy-code button artifacts like "1CopyRunInsert"
       .replace(/^\d+(?:Copy|Run|Insert|Edit)\b.*$/gm, '')
       // Collapse 3+ blank lines into 2
@@ -534,7 +604,7 @@ class DeepSeekBrowser {
 
   /**
    * Dump useful DOM information to stdout.
-   * Called by `node src/calibrate.js` or `--debug` flag.
+   * Called by `deepseek-agent --calibrate`.
    */
   async dumpDebugInfo() {
     const info = await this.page.evaluate(() => {
@@ -577,7 +647,7 @@ class DeepSeekBrowser {
   }
 
   /** Take a screenshot (for debugging) */
-  async screenshot(filePath = '/tmp/deepseek-agent-debug.png') {
+  async screenshot(filePath = path.join(os.tmpdir(), 'deepseek-agent-debug.png')) {
     await this.page.screenshot({ path: filePath, fullPage: false });
     logger.info(`Screenshot saved: ${filePath}`);
   }
